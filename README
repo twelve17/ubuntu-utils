@@ -1,0 +1,8 @@
+A collection of random admin-y scripties I use in Ubuntu.
+
+removeKernel.sh
+---------------
+
+Removes kernel and kernel related packages.  With help from:
+
+http://sandakith.wordpress.com/2007/11/25/remove-the-old-kernel-from-ubuntu/
