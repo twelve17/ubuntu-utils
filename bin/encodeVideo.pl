@@ -21,6 +21,8 @@ my $result = $p->getoptions(
 
 if ($result) {
     my $enc = new Video::Encode(dryRun => $dryRun, reuseIntermediaryFiles => $reuseFiles);
+    $SIG{INT} = sub { $enc->handleInt() };
+    $SIG{__DIE__} = sub { $enc->cleanUp(1) };
     $enc->encodeFile(presetName => $preset, inputFile => $inputFile, bitRate => $bitRate);
     #print Dumper($enc);
 }
@@ -28,6 +30,7 @@ if ($result) {
 #=============================================================================
 # Notes:
 # Video file MUST end in .264 so that MP4Box recognizes it as a H264 raw file.
+# TODO: cleanup fifo/tmp files when done
 #=============================================================================
 
 package Video::Encode;
@@ -66,27 +69,110 @@ sub initialize {
 
     my %programs = (
         mac => { 
-            sox => "/opt/local/bin/sox",
-            mencoder => "/opt/local/bin/mencoder",
-            ffmpeg => "/opt/local/bin/ffmpeg",
-            mp4box => "/opt/bin/mp4box",
-            movtowav => "/opt/bin/movtowav",
-            normalize => "/opt/bin/normalize",
-            qaac_enc => "TODO: http://forum.doom9.org/showthread.php?s=a01d113d2907ffb5a2c00b0d0694a989&t=154233&page=2"
+            sox => { 
+                path => "/opt/local/bin/sox",
+            },
+            mencoder => { 
+                path => "/opt/local/bin/mencoder",
+            },
+            ffmpeg => { 
+                path => "/opt/local/bin/ffmpeg",
+            },
+            mp4box => { 
+                path => "/opt/bin/mp4box",
+            },
+            movtowav => { 
+                path => "/opt/bin/movtowav",
+            },
+            normalize => { 
+                path => "/opt/bin/normalize",
+            },
+            qaac_enc => { 
+                path => "TODO: http://forum.doom9.org/showthread.php?s=a01d113d2907ffb5a2c00b0d0694a989&t=154233&page=2"
         },
+            },
         linux => {
-            sox => "/usr/bin/sox",
-            mencoder => "/usr/local/bin/mencoder",
-            ffmpeg => "/usr/bin/ffmpeg",
-            #mp4box => "/usr/bin/MP4Box",
-            mp4box => "/usr/local/bin/MP4Box",
-            mplayer => "/usr/local/bin/mplayer",
-            normalize => "/usr/bin/normalize-audio",
-            faac => "/usr/bin/faac",
-            neroAacEnc => "$ENV{HOME}/bin/nero/linux/neroAacEnc",
+            sox => { 
+                path => "/usr/bin/sox",
+            },
+            mencoder => { 
+                path => "/usr/local/bin/mencoder",
+                tokens => {
+                    # use video filters: "yet another deinterlacing filter", Motion compensating deinterlacer
+                    YADIF_AND_MOTION_DEINTERLACER => 'yadif=3,mcdeint=2:1:10',
+
+                    # harddup: "This uses slightly more space, but is necessary for output to MPEG files or if you plan to demux and remux the video stream after  encoding."
+                    MEDIAN_DEINTERLACER_AND_FRAME_DUPLICATION => 'pp=md,harddup', 
+
+                    # http://www.mplayerhq.hu/DOCS/tech/colorspaces.txt
+                    # this seems to be the common colorspace used in h264, although it is possible to use higher
+                    # quality color spaces:
+                    # http://en.wikipedia.org/wiki/YUV_4:2:2#4:2:0
+                    RAW_VIDEO_I420_FORMAT => 'format=i420',
+                    
+                    RAW_EXTRACT => [
+                        '-of rawvideo',
+                        '-ofps @FPS@',
+                        '-nosound',
+                        '-benchmark',
+                        '-ovc raw',
+                   ],
+
+                   X264_ENCODE_COMMON => [
+                        '-nosound',
+                        '-of rawvideo',
+                        '-ovc x264',
+                   ],
+
+                   # http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-x264.html
+                   # subq & frameref: lower # = faster, use low # for 1st pass to increase its speed. 
+                   # crf: constant quality mode (crf=20)
+                   X264_ENCODE_PASS1_COMMON => 'subq=1:frameref=1:pass=1',
+
+                   X264_ENCODE_PASS2_COMMON => 'subq=5:8x8dct:frameref=2:bframes=3:b_pyramid=normal:weight_b',
+
+                   # http://sites.google.com/site/linuxencoding/x264-encoding-guide 
+                   X264_ENCODE_PASS_2_IPHONE_IPOD5_5G => '@X264_ENCODE_COMMON@ -x264encopts @X264_ENCODE_PASS2_COMMON@:level_idc=30:vbv-maxrate=10000:vbv_bufsize=10000',
+                   X264_ENCODE_PASS_2_IPHONE_IPOD => '@X264_ENCODE_COMMON@ -x264encopts @X264_ENCODE_PASS2_COMMON@:level_idc=1.3:nocabac:vbv-maxrate=768:vbv_bufsize=768',
+
+                   X264_ENCODE_PASS_1 => '@X264_ENCODE_COMMON@ -x264encopts @X264_ENCODE_PASS1_COMMON@',
+                   X264_ENCODE_PASS_2 => '@X264_ENCODE_COMMON@ -x264encopts @X264_ENCODE_PASS2_COMMON@:pass=2:bitrate=@BITRATE@:vbv-maxrate=@MAX_BITRATE@:vbv_bufsize=@BITRATE_AVG_PERIOD_BUF_SIZE@',
+                }
+            },
+            ffmpeg => { 
+                path => "/usr/bin/ffmpeg",
+            },
+            mp4box => { 
+                path => "/usr/local/bin/MP4Box",
+            },
+            mplayer => { 
+                path => "/usr/local/bin/mplayer",
+                tokens => {
+                    RAW_EXTRACT => [
+                        '-quiet',
+                        '-nocorrect-pts',
+                        '-benchmark',
+                        '-vc null',
+                        '-vo null',
+                        # (mplayer's 'file' option does not have stdout "-" option)
+                        '-ao pcm:fast:file=@FIFO_FILE@',
+                   ],
+               },
+            },
+            normalize => { 
+                path => "/usr/bin/normalize-audio",
+            },
+            faac => { 
+                path => "/usr/bin/faac",
+            },
+            neroAacEnc => { 
+                path => "$ENV{HOME}/bin/nero/linux/neroAacEnc",
+            },
             # installed from source
-            x264 => "/usr/local/bin/x264"
+            x264 => { 
+                path => "/usr/local/bin/x264"
         },
+            },
     );
 
     $s->{workDir} = $args{workDir} || $ENV{PWD};
@@ -95,55 +181,50 @@ sub initialize {
 
     $s->{inputFileExtensions} = qr/\.([Aa][Vv][Ii]|[Mm][Pp][Gg]|[Mm][Pp][Ee][Gg]|[Dd][Vv]|[Ff][Ll][Vv])$/;
 
+    $s->{taskDefaults} = {
+        extractVideo => {
+            outputFileSuffix => '.rawvideo',
+            progOutputPrefix => 'EXTRACT_VIDEO',
+        },
+        encodeVideo => {
+            outputFileSuffix => '.264',
+            progOutputPrefix => 'ENCODE_VIDEO',
+        },
+        extractAudio => {
+            outputFileSuffix => '.rawaudio',
+            progOutputPrefix => 'EXTRACT_AUDIO',
+        },
+        encodeAudio => {
+            outputFileSuffix => '.m4a',
+            progOutputPrefix => 'ENCODE_AUDIO',
+        },
+        mux => {
+            outputFileSuffix => '.mp4',
+            progOutputPrefix => 'MUX_TRACKS',
+        },
+    };
+
     # TODO: externalize config
     $s->{presets} = {
         hq1 => {
-            desc => 'High Quality: Full Size, Deinterlaced, AAC Audio.  MPlayer extracts and encodes video.  MPlayer extract audio, neroEnc encodes audo.',
+            desc => 'Full Size, Deinterlaced, AAC Audio.  MPlayer extracts and encodes video.  MPlayer extract audio, neroEnc encodes audio.',
             extractVideo => {
                 prog => 'mplayer',
                 fork => 1,
-                files => {
-                    log => '.264.extract.log',
-                    fifo => '.264.fifo',
-                },
                 args => [
                     '@INPUT_FILE@',
-                    # output raw video
-                    '-of rawvideo',
-                    '-ofps @FPS@',
-                    '-ovc raw',
-                    # use video filters: "yet another deinterlacing filter", Motion compensating deinterlacer, output to raw i420 format
-                    #'-vf yadif=3,mcdeint=2:1:10,format=i420',
-                    #'-vf pp=md,harddup,format=i420', #
-                    #'-vf yadif=1,format=i420', #
-                    # we're dealing with video only. ignore sound.
-                    '-vf pp=md,harddup', #
-                    '-nosound',
-                    '-benchmark',
+                    '-vf @MEDIAN_DEINTERLACER_AND_FRAME_DUPLICATION@',
                     '-vo yuv4mpeg:file=@FIFO_FILE@',
-                    '-really-quiet',
-                    # output video to stdout...
-                    #'-o -', 
-                    # ...but log details to log file
-                    '2> @LOG_FILE@',
-                    # pipe to encoder
-                    #'| @ENCODE_COMMAND@'
                 ],
             },
             encodeVideo => {
                 prog => 'x264',
-                files => {
-                    fifo => '.264.fifo',
-                    input => undef,
-                    log => undef,
-                    output => '.264',
-                },
                 args => [
+                    '--threads auto',
                     # expect raw input
                     '--demuxer y4m',
                     # Quality-based VBR (0-51, 0=lossless) [23.0]
                     '--crf 20',
-                    '--threads auto',
                     #'--fps @FPS@',
                     '--input-res @RESOLUTION@',
                     '--output @OUTPUT_FILE@',
@@ -154,28 +235,13 @@ sub initialize {
             extractAudio => {
                 prog => 'mplayer',
                 fork => 1,
-                files => {
-                    log => '.m4a.extract.log',
-                    fifo => '.m4a.fifo',
-                },
                 args => [
-                    '-quiet',
-                    '-nocorrect-pts',
-                    '-vo null',
-                    '-vc null',
-                    # (mplayer's 'file' option does not have stdout "-" option)
-                    '-ao pcm:fast:file=@FIFO_FILE@',
-                   '@INPUT_FILE@',
-                   '2>&1 > @LOG_FILE@'
+                    '@RAW_EXTRACT@',
+                    '@INPUT_FILE@',
                 ],
             },
             encodeAudio => {
                 prog => 'neroAacEnc',
-                files => {
-                    log => '.m4a.encode.log',
-                    fifo => '.m4a.fifo',
-                    output => '.m4a',
-                },
                 args => [
                     '-ignorelength',
                     # "use LC AAC profile (supported by most devices)"
@@ -185,13 +251,10 @@ sub initialize {
                     # read from extractor
                     '-if @FIFO_FILE@',
                     '-of @OUTPUT_FILE@',
-                    # log details to separate log file
-                    '2> @LOG_FILE@'
                 ],
             },
             mux => {
                 prog => 'mp4box',
-                files => { output => '.mp4' },
                 args => [
                     '-fps @FPS@',
                     '-add @VIDEO_INPUT_FILE@',
@@ -200,43 +263,27 @@ sub initialize {
                 ],
             }
         },
-    };
-
-    $s->{presets}->{hq2} = {
-            desc => 'High Quality: Full Size, Deinterlaced, AAC Audio',
+        hq2 => {
+            desc => 'Same as hq1, except no deinterlacing and mencoder does extraction and encoding.',
             encodeVideo => {
                 prog => 'mencoder',
-                files => {
-                    log => '.264.encode.log',
-                    output => '.264',
-                },
                 args => {
                     pass1 => [
-                        '-of rawvideo',
-                        '-ovc x264',
-                        # http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-x264.html
-                        '-x264encopts subq=1:frameref=1:pass=1:crf=20',
-                        '-nosound',
+                        '@X264_ENCODE_PASS_1@',
                         '-o @OUTPUT_FILE@',
                         '@INPUT_FILE@'
                     ],
                     pass2 => [
-                        #'-vf scale,pp=md,harddup',
-                        #'-vf yadif',
-                        '-of rawvideo',
-                        '-ovc x264',
-                        '-x264encopts subq=5:8x8dct:frameref=2:bframes=3:b_pyramid=normal:weight_b:pass=2:bitrate=@BITRATE@:vbv-maxrate=@MAX_BITRATE@:vbv_bufsize=@BITRATE_AVG_PERIOD_BUF_SIZE@',
-                        # fast
-                        #'-x264encopts subq=4:bframes=2:b_pyramid=normal:weight_b',
-                        '-nosound',
+                        '@X264_ENCODE_PASS_2@',
                         '-o @OUTPUT_FILE@',
                         '@INPUT_FILE@'
                     ],
                 }
             },
-            extractAudio => $s->{presets}->{hq1}->{extractAudio},
-            encodeAudio => $s->{presets}->{hq1}->{encodeAudio},
-            mux => $s->{presets}->{hq1}->{mux},
+            extractAudio => 'alias:hq1',
+            encodeAudio => 'alias:hq1',
+            mux => 'alias:hq1',
+        }
     };
 }
 
@@ -260,17 +307,17 @@ sub determineBitRates {
 
     if (defined $args{bitRate}) {
 
-        $ret->{bitRate} = ($args{bitRate} eq 'source' ? ($args{videoInfo}->{VIDEO_BITRATE} / 1000) : $args{bitRate});
-        $ret->{maxBitRate} = $args{maxBitRate} || $ret->{bitRate};
-        $ret->{bitRateAvgPeriodBufSize} = $ref->{bitRate} * 2;
+        $ret{bitRate} = ($args{bitRate} eq 'source' ? ($args{videoInfo}->{VIDEO_BITRATE} / 1000) : $args{bitRate});
+        $ret{maxBitRate} = $args{maxBitRate} || $ret{bitRate};
+        $ret{bitRateAvgPeriodBufSize} = $ret{bitRate} * 2;
 
-        print "using bitrate: $bitRate, max: $maxBitRate, bufSize: $bitRateAvgPeriodBufSize\n";
+        print "using bitrate: $ret{bitRate}, max: $ret{maxBitRate}, bufSize: $ret{bitRateAvgPeriodBufSize}\n";
 
         while (my ($type,$value) = each (%ret)) {
             if ($value =~ /^(\d+)\.(\d*)$/) {
                 my $new = $1;
-                print "found decimal places in bitrate.  truncating value ($value -> $new), as x264 won't accept fractional bitrates"
-                $ret->{$type} = $new;
+                print "found decimal places in $type.  truncating value ($value -> $new), as x264 won't accept fractional values for bitrates\n";
+                $ret{$type} = $new;
             }
         }
     }
@@ -328,6 +375,8 @@ sub encodeFile {
         preset => $preset, 
         fps => $fps,
     );
+
+    $s->cleanUp();
 }
 
 #-----------------------------------------------------------------------------
@@ -411,6 +460,7 @@ sub _encodeTrack {
             prog => $args{encodeTask}->{prog}, 
             args => $args{encodeTask}->{args}, 
             tokens => $args{encodeTokens},
+            outputPrefix => $args{encodeTask}->{progOutputPrefix},
         );
     }
 }
@@ -427,6 +477,10 @@ sub muxTracks {
         }
     }
 
+    if ($s->isReusingFile(file => $args{preset}->{mux}->{files}->{output})) {
+        return;
+    }
+
     $s->doCommandBatch(
         prog => $args{preset}->{mux}->{prog}, 
         args => $args{preset}->{mux}->{args}, 
@@ -434,7 +488,8 @@ sub muxTracks {
             AUDIO_INPUT_FILE => $args{preset}->{encodeAudio}->{files}->{output},
             VIDEO_INPUT_FILE => $args{preset}->{encodeVideo}->{files}->{output},
             FPS => $args{fps},
-        }
+        },
+        outputPrefix => $args{preset}->{mux}->{progOutputPrefix},
     );
 }
 
@@ -463,14 +518,13 @@ sub doExtractWithEncodeCommands {
         # parent
         if ($pid) {
             print "extract pid = $pid, parent = $$\n";
-            push(@{$s->{childPids}}, $pid);
+            $s->registerPid($pid);
    
-            sleep(4);
- 
             $s->doCommandBatch(
                 prog => $args{encodeTask}->{prog}, 
                 args => $args{encodeTask}->{args}, 
-                tokens => $args{encodeTokens}
+                tokens => $args{encodeTokens},
+                outputPrefix => $args{encodeTask}->{progOutputPrefix},
             ); 
     
             my $tmp = waitpid($pid, 0);
@@ -478,12 +532,14 @@ sub doExtractWithEncodeCommands {
         }
         # child
         elsif ($pid == 0) {
+            sleep(4);
             $s->doCommandBatch(
                 prog => $args{extractTask}->{prog}, 
                 args => $args{extractTask}->{args}, 
-                tokens => $args{extractTokens}
+                tokens => $args{extractTokens},
+                outputPrefix => $args{extractTask}->{progOutputPrefix},
             ); 
-            exit(0);
+            $s->cleanUp(0);
         }
         else {
             die "couldn't fork: $!";
@@ -507,7 +563,8 @@ sub doExtractWithEncodeCommands {
         $s->doCommandBatch(
             prog => $args{extractTask}->{prog}, 
             args => $args{extractTask}->{args}, 
-            tokens => $args{encodeTokens}
+            tokens => $args{encodeTokens},
+            outputPrefix => $args{encodeTask}->{progOutputPrefix},
         ); 
     }
 }
@@ -530,7 +587,6 @@ sub getVideoInfo {
     else {
         my %info;
         my $result = $s->runProg(name => "mplayer", args => $opts, showOutput => 0, dryRun => 0);
-        #print "result:" . Dumper($result);
         foreach my $line(split(/\n/, $result->{output})) {
             next if ($line !~ /=/ || $line !~ /^ID_/);
             my ($k,$v) = split('=', $line);
@@ -561,35 +617,95 @@ sub resolvePreset {
 
     # resolve file paths
     while (my ($task, $ref) = each %preset) {
+
+        if ($ref =~ /^(alias:)(.+)$/) {
+            print "task '$task' is an alias to same task in preset '$2'\n";
+            if (defined $s->{presets}->{$2}) {
+                $ref = \%{ clone ($s->{presets}->{$2}->{$task}) };
+                $preset{$task} = $ref;
+            }
+            else {
+                die "$task task alias '$1' does not exist";
+            }
+        }
+
         next if (ref($ref) ne 'HASH' || ! defined $ref->{prog});
+
+        # 1. grab task defaults and merge to this task
+
+        if (defined $s->{taskDefaults}->{$task}) {
+            print "adding task defaults for '$task'\n";
+            while (my ($k, $v) = each %{$s->{taskDefaults}->{$task}}) {
+                if (defined $ref->{$k}) {
+                    warn "overwriting preset setting '$k': $ref->{$k} -> $v\n";
+                }
+                $ref->{$k} = $v;
+            } 
+        }
 
         my %tokens = (INPUT_FILE => $args{inputFile});
 
-        if (defined $ref->{files}) {
+        my $files = $ref->{files} = {};
 
-            my $files = $ref->{files};
+        # could not get basename(file, regexp) to work, so we'll do it ourselves
+        $baseName =~ s/$s->{inputFileExtensions}//;
 
-            # could not get basename(file, regexp) to work, so we'll do it ourselves
-            $baseName =~ s/$s->{inputFileExtensions}//;
+        # 2. create built in file tokens
 
+        if (defined $s->{taskDefaults}->{$task}) {
             foreach my $type qw(log output fifo) {
-                if (defined $files->{$type}) {
-                    my $fileName = $baseName . $files->{$type}; 
-                    $ref->{files}->{$type} = $fileName;
 
-                    my $token = uc($type) . '_FILE';
-                    $tokens{$token} = $fileName;
+                my $token = uc($type) . '_FILE';
 
-                    if ($type eq 'fifo') {
-                        my $fullPath = $s->{workDir} . '/' . $ref->{files}->{fifo};
-                        print "fifo path is: $fullPath\n";
-                        if (! -p $fullPath) {
-                            mkfifo($fullPath, 0700) || die "could not mkfifo path '$fullPath': $!";
-                        }
+                my $outputFileSuffix = $ref->{outputFileSuffix};
+
+                # kinda hack-y. if this is the encode task, use the FIFO name from its extract task, if there is one    
+		if ($type eq 'fifo' && $task =~ /^encode(.+)/) {
+                    my $extractRef = $s->{taskDefaults}->{'extract' . $1};
+                    if (defined $extractRef && defined $extractRef->{outputFileSuffix}) {
+                        print "encode task will use fifo extension from extract task: $extractRef->{outputFileSuffix}\n";
+                        $outputFileSuffix = $extractRef->{outputFileSuffix};
+                    }
+                    else {
+                        print "encode task will use its own fifo extension: $outputFileSuffix\n";
+                    }
+                }
+
+                my $fileName = $baseName . $outputFileSuffix;
+                if ($type ne 'output') {
+                    $fileName .= '.' . $type; 
+                }
+                $files->{$type} = $fileName;
+                $tokens{$token} = $fileName;
+    
+                if ($ref->{fork} && $type eq 'fifo') {
+                    my $fullPath = $s->{workDir} . '/' . $fileName;
+                    print "fifo path is: $fullPath\n";
+                    if (! -p $fullPath && ! $s->{dryRun}) {
+                        mkfifo($fullPath, 0700) || die "could not mkfifo path '$fullPath': $!";
                     }
                 } 
             } 
         } 
+
+        # 3. grab program level default tokens
+
+        my $cmdConfig = $s->getProgConfig($ref->{prog});
+        if (defined $cmdConfig->{tokens}) {
+            print "injecting program default tokens\n";
+            while (my($name,$value) = each %{$cmdConfig->{tokens}}) {
+                if (ref($value) eq 'ARRAY') {
+                    $tokens{$name} = join(' ', @{$value});
+                }
+                else { 
+                    $tokens{$name} = $value;
+                }
+            }
+        }
+
+        #print "tokens now are (pre fill):", Dumper(\%tokens);
+
+        # 4. resolve all tokens from above into this task's args
 
         if (ref($ref->{args}) eq 'HASH') {
             while (my ($batchName, $batchArgs) = each(%{$ref->{args}})) {
@@ -617,20 +733,26 @@ sub fillTokens {
         }
     }
 
-    my $loop = $args{args};
-    if (ref($loop) eq 'HASH') {
-        while (my ($ref) = values(%{$loop})) {
-        }
-    }
-    else {
-        foreach my $arg (@{$args{args}}) {
+    foreach my $arg (@{$args{args}}) {
+OUTER:      while (1) {
+            my $found = 0;
             while (my($k,$v) = each %{$args{tokens}}) {
                 my $token = '@' . $k . '@';
                 if ($arg =~ /$token/) {
-                   $arg =~ s/$token/$v/g;
+                   $found++;
+                   my $tokenValue = $v;
+                   #print "token=$k, value=$tokenValue, arg=$arg\n"; 
+                   $arg =~ s/$token/$tokenValue/g;
                 } 
-            } 
-        }
+            }
+            if ($arg !~ /@/ || $found == 0) {
+                last OUTER;
+                sleep 2;
+            }
+            if ($found > 999) {
+                die "potential endless loop";
+            }
+        } 
     }
 }
 
@@ -642,8 +764,11 @@ sub isReusingFile {
     if ($s->{reuseIntermediaryFiles}) {
         my $destFile = $s->{workDir} . '/' . $args{file};
         if (-f $destFile) {
-            print "encoded file '$destFile' already exists. using it.\n";
+            print "target file '$destFile' already exists. using it.\n";
             return 1;
+        }
+        else {
+            print "target file '$destFile' does not exist.\n";
         }
     }
 
@@ -682,6 +807,7 @@ sub getCommandWithArgs {
     }
    
     my $command = $s->getProgPath($args{prog});
+
     if (defined $args{args}) {
         if (ref($args{args}) eq 'ARRAY') {
             my $parsedArgs= $s->getCommandArgs(args => $args{args}, tokens => $args{tokens}); 
@@ -707,6 +833,8 @@ sub getCommandArgs {
         }
     }
 
+    my $allowMissingTokenValues = (defined $args{allowMissingTokenValues} ? $args{allowMissingTokenValues} : 0);
+
     my @tokenized;
 
     foreach my $arg(@{$args{args}}) {  # AAARRRRGSSS MATEY!
@@ -716,8 +844,13 @@ sub getCommandArgs {
                die "tokens not defined. cannot resolve token '$token'";
            }
            else {
-               my $value = $args{tokens}->{$token} || die "value for token '$token' not found";
-               $arg =~ s/$1$2$3/$value/;  
+               my $value = $args{tokens}->{$token};
+               if (defined $value) {
+                   $arg =~ s/$1$2$3/$value/;  
+               }
+               elsif (!$allowMissingTokenValues) {
+                   die "value for token '$token' not found";
+               } 
                #print "arg is now: $arg\n";
            } 
         }
@@ -729,11 +862,24 @@ sub getCommandArgs {
 }
 
 #-----------------------------------------------------------------------------
-sub getProgPath {
+sub getProgConfig {
     my $s = shift;
     my $name = shift || die "no name";
     if (defined $s->{progs}->{$name}) {
         return $s->{progs}->{$name};
+    }
+    else {
+        die "config for program '$name' not found";
+    }
+}
+
+#-----------------------------------------------------------------------------
+sub getProgPath {
+    my $s = shift;
+    my $name = shift || die "no name";
+    my $config = $s->getProgConfig($name);
+    if (defined $config->{path}) {
+        return $config->{path};
     }
     else {
         die "path for program '$name' not found";
@@ -766,7 +912,9 @@ sub doCommandBatch {
         }
     }
 
-    print "args (" . ref($args{args})  . "):\n", Dumper(\%args);
+    #print "args (" . ref($args{args})  . "):\n", Dumper(\%args);
+
+    my $outputPrefix = (defined $args{outputPrefix} ? $args{outputPrefix} : 1); 
 
     if (ref($args{args}) eq 'HASH') {
         while (my($batchName, $batchArgs) = each %{$args{args}}) {
@@ -776,13 +924,13 @@ sub doCommandBatch {
                 args => $batchArgs, 
                 tokens => $args{tokens}
             );
-            $s->doCommand($command, 1, $s->{dryRun});
+            $s->doCommand($command, $outputPrefix, $s->{dryRun});
         }
     }    
     else {
         print "command is not a batch command.\n";
         my $command = $s->getCommandWithArgs(%args);
-        $s->doCommand($command, 1, $s->{dryRun});
+        $s->doCommand($command, $outputPrefix, $s->{dryRun});
     } 
 }
 
@@ -811,22 +959,60 @@ sub doCommand {
         print "doing command (output=$showOutput): $cmd\n";
 
         $stats{pid} = CORE::open(PH, "$cmd 2>&1 |") || die "error running command '$cmd': $!";
-            while (my $tmp = <PH>) {
-                if($showOutput) {
+
+        $s->registerPid($stats{pid});
+
+        while (my $tmp = <PH>) {
+            if($showOutput) {
+                if ($showOutput eq "1") {
                     print $tmp; # print the command as it runs so we aren't clueless until it's done
                 }
-                $stats{output} .= $tmp;
+                else {
+                    print $showOutput . ': ' . $tmp; # same as a bove, but with a prefix, so we can grep out parts of the process
+                }
             }
+            $stats{output} .= $tmp;
+        }
+
         CORE::close(PH) || die "command pipe close() had errors for command '$cmd'";
-    
+   
+        # TODO: cleanup child pids array?
+ 
         $stats{rc} =  ($? >> 8);  # from perlvar man page (search for $?):
                                   # $? >> 8 returns the real return code
 
         if ($stats{rc} > 0) {
-            die "non-zeror return code from command: $cmd";
+            die "non-zero return code from command: $cmd";
         } 
         return \%stats;
     }
+}
+
+#-----------------------------------------------------------------------------
+sub registerPid {
+    my $s = shift;
+    my $pid = shift || die "no pid received";
+    unshift(@{$s->{childPids}}, $pid);
+}
+
+#-----------------------------------------------------------------------------
+sub cleanUp {
+    my $s = shift;
+    my $exitCode = shift;
+    if (scalar(@{$s->{childPids}})) {
+        print "killing children: ", join(',', @{$s->{childPids}}), "\n";
+        kill 15, @{$s->{childPids}};
+    }
+    if (defined $exitCode) {
+        exit($exitCode);
+    }
+}
+
+#-----------------------------------------------------------------------------
+sub handleInt {
+    my $s = shift;
+    print "caught INT\n";
+    $s->cleanUp(1);
 }
 
 1;
