@@ -7,10 +7,8 @@ use Data::Dumper;
 use Getopt::Long;
 
 my $p = new Getopt::Long::Parser;
-
 $p->configure();
-
-my ($reuseFiles, $dryRun, $inputFile);
+my ($reuseFiles, $dryRun, $inputFile, $bitRate);
 my $preset = 'hq';
 
 my $result = $p->getoptions(
@@ -18,15 +16,18 @@ my $result = $p->getoptions(
     "d|dry-run" => \$dryRun,
     "i|input-file=s" => \$inputFile,
     "p|preset=s" => \$preset,
+    "b|bitrate=s" => \$bitRate,
 );
 
 if ($result) {
     my $enc = new Video::Encode(dryRun => $dryRun, reuseIntermediaryFiles => $reuseFiles);
-    $enc->encodeFile(presetName => $preset, inputFile => $inputFile);
-    # encoded 31329 frames, 4.64 fps, 3619.98 kb/s
+    $enc->encodeFile(presetName => $preset, inputFile => $inputFile, bitRate => $bitRate);
     #print Dumper($enc);
 }
 
+#=============================================================================
+# Notes:
+# Video file MUST end in .264 so that MP4Box recognizes it as a H264 raw file.
 #=============================================================================
 
 package Video::Encode;
@@ -75,10 +76,11 @@ sub initialize {
         },
         linux => {
             sox => "/usr/bin/sox",
-            mencoder => "/usr/bin/mencoder",
+            mencoder => "/usr/local/bin/mencoder",
             ffmpeg => "/usr/bin/ffmpeg",
-            mp4box => "/usr/bin/MP4Box",
-            mplayer => "/usr/bin/mplayer",
+            #mp4box => "/usr/bin/MP4Box",
+            mp4box => "/usr/local/bin/MP4Box",
+            mplayer => "/usr/local/bin/mplayer",
             normalize => "/usr/bin/normalize-audio",
             faac => "/usr/bin/faac",
             neroAacEnc => "$ENV{HOME}/bin/nero/linux/neroAacEnc",
@@ -87,26 +89,22 @@ sub initialize {
         },
     );
 
-
     $s->{workDir} = $args{workDir} || $ENV{PWD};
 
     $s->{progs} = $programs{$s->getPlatform()} || die "could not determine platform";
 
-    $s->{inputFileExtensions} = qr/\.([Aa][Vv][Ii]|[Mm][Pp][Gg]|[Mm][Pp][Ee][Gg]|[Dd][Vv])$/;
+    $s->{inputFileExtensions} = qr/\.([Aa][Vv][Ii]|[Mm][Pp][Gg]|[Mm][Pp][Ee][Gg]|[Dd][Vv]|[Ff][Ll][Vv])$/;
 
-    #local mencoder_ovc_opts="-ovc x264 -x264encopts threads=2:me=umh:bitrate=$vbitrate:subq=6:partitions=all:8x8dct:frameref=5:bframes=3:b_pyramid:weight_b"
-    #local mencoder_other_opts="-passlogfile $tmpdir/$pass_log_file -ofps $fps -vf pp=md,harddup -of rawvideo -nosound"
-    #for num in 1 2; do
-    #    "$MENCODER_BIN" "$in_video_file" ${mencoder_ovc_opts}:pass=${num} $mencoder_other_opts -o $tmpdir/$out_264_video_file
-    #done
-
+    # TODO: externalize config
     $s->{presets} = {
-        hq => {
-            desc => 'High Quality: Full Size, Deinterlaced, AAC Audio',
+        hq1 => {
+            desc => 'High Quality: Full Size, Deinterlaced, AAC Audio.  MPlayer extracts and encodes video.  MPlayer extract audio, neroEnc encodes audo.',
             extractVideo => {
-                prog => 'mencoder',
+                prog => 'mplayer',
+                fork => 1,
                 files => {
-                    log => '.m4v.extract.log',
+                    log => '.264.extract.log',
+                    fifo => '.264.fifo',
                 },
                 args => [
                     '@INPUT_FILE@',
@@ -119,34 +117,38 @@ sub initialize {
                     #'-vf pp=md,harddup,format=i420', #
                     #'-vf yadif=1,format=i420', #
                     # we're dealing with video only. ignore sound.
+                    '-vf pp=md,harddup', #
                     '-nosound',
-                    #'-really-quiet',
+                    '-benchmark',
+                    '-vo yuv4mpeg:file=@FIFO_FILE@',
+                    '-really-quiet',
                     # output video to stdout...
-                    '-o -', 
+                    #'-o -', 
                     # ...but log details to log file
                     '2> @LOG_FILE@',
                     # pipe to encoder
-                    '| @ENCODE_COMMAND@'
+                    #'| @ENCODE_COMMAND@'
                 ],
             },
             encodeVideo => {
                 prog => 'x264',
                 files => {
+                    fifo => '.264.fifo',
                     input => undef,
                     log => undef,
-                    output => '.m4v',
+                    output => '.264',
                 },
                 args => [
                     # expect raw input
-                    '--demuxer raw',
+                    '--demuxer y4m',
                     # Quality-based VBR (0-51, 0=lossless) [23.0]
                     '--crf 20',
                     '--threads auto',
-                    '--fps @FPS@',
+                    #'--fps @FPS@',
                     '--input-res @RESOLUTION@',
                     '--output @OUTPUT_FILE@',
-                    # read stdin (from mencoder)
-                    '-'
+                    # read from encoder
+                    '@FIFO_FILE@'
                 ],
             },
             extractAudio => {
@@ -161,7 +163,7 @@ sub initialize {
                     '-nocorrect-pts',
                     '-vo null',
                     '-vc null',
-                    # subshell to encoder (mplayer's 'file' option does not have stdout "-" option)
+                    # (mplayer's 'file' option does not have stdout "-" option)
                     '-ao pcm:fast:file=@FIFO_FILE@',
                    '@INPUT_FILE@',
                    '2>&1 > @LOG_FILE@'
@@ -180,7 +182,7 @@ sub initialize {
                     '-lc',
                     # target quality mode (vbr),
                     '-q 0.6',
-                    # read from stdin
+                    # read from extractor
                     '-if @FIFO_FILE@',
                     '-of @OUTPUT_FILE@',
                     # log details to separate log file
@@ -197,113 +199,317 @@ sub initialize {
                     '@OUTPUT_FILE@'
                 ],
             }
-        }
+        },
+    };
+
+    $s->{presets}->{hq2} = {
+            desc => 'High Quality: Full Size, Deinterlaced, AAC Audio',
+            encodeVideo => {
+                prog => 'mencoder',
+                files => {
+                    log => '.264.encode.log',
+                    output => '.264',
+                },
+                args => {
+                    pass1 => [
+                        '-of rawvideo',
+                        '-ovc x264',
+                        # http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-x264.html
+                        '-x264encopts subq=1:frameref=1:pass=1:crf=20',
+                        '-nosound',
+                        '-o @OUTPUT_FILE@',
+                        '@INPUT_FILE@'
+                    ],
+                    pass2 => [
+                        #'-vf scale,pp=md,harddup',
+                        #'-vf yadif',
+                        '-of rawvideo',
+                        '-ovc x264',
+                        '-x264encopts subq=5:8x8dct:frameref=2:bframes=3:b_pyramid=normal:weight_b:pass=2:bitrate=@BITRATE@:vbv-maxrate=@MAX_BITRATE@:vbv_bufsize=@BITRATE_AVG_PERIOD_BUF_SIZE@',
+                        # fast
+                        #'-x264encopts subq=4:bframes=2:b_pyramid=normal:weight_b',
+                        '-nosound',
+                        '-o @OUTPUT_FILE@',
+                        '@INPUT_FILE@'
+                    ],
+                }
+            },
+            extractAudio => $s->{presets}->{hq1}->{extractAudio},
+            encodeAudio => $s->{presets}->{hq1}->{encodeAudio},
+            mux => $s->{presets}->{hq1}->{mux},
     };
 }
 
 #-----------------------------------------------------------------------------
-sub runProg {
+sub determineBitRates {
     my $s = shift;
     my %args = @_;
 
     # sanity check
-    foreach my $k qw(name) {
+    foreach my $k qw(videoInfo) {
         if (! defined $args{$k}) {
             die "missing argument '$k'";
         }
     }
 
-   my $command = $s->getProgPath($args{name});
-   if ($args{args}) {
-       $command .= ' ' . $args{args};
-   }
-   $s->doCommand($command, $args{showOutput}, $args{dryRun});
+    my %ret = (
+        bitRate => undef,
+        maxBitRate => undef,
+        bitRateAvgPeriodBufSize => undef,
+    );
+
+    if (defined $args{bitRate}) {
+
+        $ret->{bitRate} = ($args{bitRate} eq 'source' ? ($args{videoInfo}->{VIDEO_BITRATE} / 1000) : $args{bitRate});
+        $ret->{maxBitRate} = $args{maxBitRate} || $ret->{bitRate};
+        $ret->{bitRateAvgPeriodBufSize} = $ref->{bitRate} * 2;
+
+        print "using bitrate: $bitRate, max: $maxBitRate, bufSize: $bitRateAvgPeriodBufSize\n";
+
+        while (my ($type,$value) = each (%ret)) {
+            if ($value =~ /^(\d+)\.(\d*)$/) {
+                my $new = $1;
+                print "found decimal places in bitrate.  truncating value ($value -> $new), as x264 won't accept fractional bitrates"
+                $ret->{$type} = $new;
+            }
+        }
+    }
+    else {
+        print "no bitrate specified.  this will cause a failure if this preset uses 2-pass encoding\n";
+    }
+
+    return \%ret;
 }
- 
+
 #-----------------------------------------------------------------------------
-sub getCommandWithArgs {
+# big daddy
+#-----------------------------------------------------------------------------
+sub encodeFile {
     my $s = shift;
     my %args = @_;
 
     # sanity check
-    foreach my $k qw(taskref) {
+    foreach my $k qw(presetName inputFile) {
         if (! defined $args{$k}) {
             die "missing argument '$k'";
         }
     }
+ 
+    my $preset = $s->resolvePreset(name => $args{presetName}, inputFile => $args{inputFile});
+
+    my $videoInfo = $s->getVideoInfo($args{inputFile});
+    print "videoInfo:\n" . Dumper($videoInfo);
+
+    print "workDir: $s->{workDir}\n";
+    chdir $s->{workDir} || die "could not cd to '$s->{workDir}': $!";
+
+    my $fps = $videoInfo->{VIDEO_FPS};
+    my $resolution = ($videoInfo->{VIDEO_WIDTH} . 'x' . $videoInfo->{VIDEO_HEIGHT});
+    my $rates = $s->determineBitRates(%args, videoInfo => $videoInfo);
+
+    $s->encodeVideoTrack(
+        preset => $preset, 
+        inputFile => $args{inputFile}, 
+        fps => $fps,
+        resolution => $resolution,
+        width => $videoInfo->{VIDEO_WIDTH},
+        height => $videoInfo->{VIDEO_HEIGHT},
+        bitRate => $rates->{bitRate},
+        maxBitRate => $rates->{maxBitRate},
+        bitRateAvgPeriodBufSize => $rates->{bitRateAvgPeriodBufSize},
+    );
+
+    $s->encodeAudioTrack(
+        preset => $preset, 
+        inputFile => $args{inputFile}, 
+    );
+
+    $s->muxTracks(
+        preset => $preset, 
+        fps => $fps,
+    );
+}
+
+#-----------------------------------------------------------------------------
+sub encodeVideoTrack {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(preset inputFile fps resolution) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    $s->_encodeTrack(
+        type => 'video',
+        inputFile => $args{inputFile},
+        extractTask => $args{preset}->{extractVideo},
+        extractTokens => {
+            FPS => $args{fps},
+        },
+        encodeTask => $args{preset}->{encodeVideo},
+        encodeTokens => {
+            FPS => $args{fps},
+            RESOLUTION => $args{resolution},
+            BITRATE => $args{bitRate},
+            MAX_BITRATE => $args{maxBitRate},
+            BITRATE_AVG_PERIOD_BUF_SIZE => $args{bitRateAvgPeriodBufSize},
+        },
+    );
+}
+
+#-----------------------------------------------------------------------------
+sub encodeAudioTrack {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(preset inputFile) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    $s->_encodeTrack(
+        type => 'audio',
+        inputFile => $args{inputFile},
+        extractTask => $args{preset}->{extractAudio},
+        encodeTask => $args{preset}->{encodeAudio},
+    );
+}
+
+#-----------------------------------------------------------------------------
+sub _encodeTrack {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(inputFile encodeTask type) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    if ($s->isReusingFile(file => $args{encodeTask}->{files}->{output})) {
+        return;
+    }
+
+    print "encoding $args{type} track from input: $args{inputFile}\n";
+
+    if (defined ($args{extractTask})) {
+        $s->doExtractWithEncodeCommands(
+            extractTask => $args{extractTask},
+            extractTokens => $args{extractTokens},
+            encodeTask  => $args{encodeTask},
+            encodeTokens  => $args{encodeTokens},
+        );
+    }
+    else {
+        $s->doCommandBatch(
+            prog => $args{encodeTask}->{prog}, 
+            args => $args{encodeTask}->{args}, 
+            tokens => $args{encodeTokens},
+        );
+    }
+}
+
+#-----------------------------------------------------------------------------
+sub muxTracks {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(preset fps) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    $s->doCommandBatch(
+        prog => $args{preset}->{mux}->{prog}, 
+        args => $args{preset}->{mux}->{args}, 
+        tokens => {
+            AUDIO_INPUT_FILE => $args{preset}->{encodeAudio}->{files}->{output},
+            VIDEO_INPUT_FILE => $args{preset}->{encodeVideo}->{files}->{output},
+            FPS => $args{fps},
+        }
+    );
+}
+
+#-----------------------------------------------------------------------------
+sub doExtractWithEncodeCommands {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(extractTask encodeTask) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    if ($s->isReusingFile(file => $args{encodeTask}->{files}->{output})) {
+        return;
+    }
+
+    # named pipe & forking approach
+    if ($args{extractTask}->{fork}) {
+
+        print "forking extraction\n";
+
+        my $pid = fork();
+        # parent
+        if ($pid) {
+            print "extract pid = $pid, parent = $$\n";
+            push(@{$s->{childPids}}, $pid);
    
-    my $command = $s->getProgPath($args{taskref}->{prog});
-    if (defined $args{taskref}->{args}) {
-        if (ref($args{taskref}->{args}) eq 'ARRAY') {
-            my $parsedArgs= $s->getCommandArgs(args => $args{taskref}->{args}, tokens => $args{tokens}); 
-            $command .= " " . $parsedArgs;
+            sleep(4);
+ 
+            $s->doCommandBatch(
+                prog => $args{encodeTask}->{prog}, 
+                args => $args{encodeTask}->{args}, 
+                tokens => $args{encodeTokens}
+            ); 
+    
+            my $tmp = waitpid($pid, 0);
+            print "pid $pid finished\n";
+        }
+        # child
+        elsif ($pid == 0) {
+            $s->doCommandBatch(
+                prog => $args{extractTask}->{prog}, 
+                args => $args{extractTask}->{args}, 
+                tokens => $args{extractTokens}
+            ); 
+            exit(0);
         }
         else {
-            $command .= " " . $args{taskref}->{args};
+            die "couldn't fork: $!";
         }
     }
-
-    return $command;
-}
-
-#-----------------------------------------------------------------------------
-sub getCommandArgs {
-    my $s = shift;
-    my %args = @_;
-
-    # sanity check
-    foreach my $k qw(args) {
-        if (! defined $args{$k}) {
-            die "missing argument '$k'";
-        }
-    }
-
-    my @tokenized;
-
-    foreach my $arg(@{$args{args}}) {  # AAARRRRGSSS MATEY!
-        while ($arg =~ /(@)([^@]+)(@)/) {
-           my $token = $2;
-           #print "found token: $token\n";
-           if (! defined($args{tokens})) {
-               die "tokens not defined. cannot resolve token '$token'";
-           }
-           else {
-               my $value = $args{tokens}->{$token} || die "value for token '$token' not found";
-               $arg =~ s/$1$2$3/$value/;  
-               #print "arg is now: $arg\n";
-           } 
-        }
-
-        push(@tokenized, $arg);
-    }
-
-    return join(" ", @tokenized);
-}
-
-#-----------------------------------------------------------------------------
-sub getProgPath {
-    my $s = shift;
-    my $name = shift || die "no name";
-    if (defined $s->{progs}->{$name}) {
-        return $s->{progs}->{$name};
-    }
+    # pipe approach
     else {
-        die "path for program '$name' not found";
+        my $encodeCommand =  $s->getCommandWithArgs(
+            prog => $args{encodeTask}->{prog}, 
+            args => $args{encodeTask}->{args}, 
+            tokens => $args{encodeTokens}
+        ); 
+    
+        if (defined $args{extractTokens}) {
+            $args{extractTokens}->{ENCODE_COMMAND} = $encodeCommand;
+        }
+        else {
+            $args{extractTokens} = { ENCODE_COMMAND => $encodeCommand };
+        }
+    
+        $s->doCommandBatch(
+            prog => $args{extractTask}->{prog}, 
+            args => $args{extractTask}->{args}, 
+            tokens => $args{encodeTokens}
+        ); 
     }
-}
-
-#-----------------------------------------------------------------------------
-sub getPlatform {
-    my $s = shift;
-    my $ret = $s->doCommand("uname", 0, 0);
-    if ($ret->{output} eq "Darwin") {
-        print "Mac OS Detected\n";
-        return "mac";
-    }
-    else {
-        print "Linux OS Detected\n";
-        return "linux";  
-    } 
 }
 
 #-----------------------------------------------------------------------------
@@ -312,13 +518,11 @@ sub getVideoInfo {
     my $file = shift || die "no file";
     my $key = shift;
 
-
     # http://lists.mplayerhq.hu/pipermail/mplayer-users/2007-March/066366.html
     my $opts = "-identify -vo null -frames 0 $file";
 
     if ($key) {
         my $result = $s->runProg(name => "mplayer", args => "$opts | grep $key", showOutput => 0, dryRun => 0);
-        #print "result with key:" . Dumper($result);
         my $output = $result->{output};
         $output =~ s/$key=//;
         return $output;
@@ -328,7 +532,6 @@ sub getVideoInfo {
         my $result = $s->runProg(name => "mplayer", args => $opts, showOutput => 0, dryRun => 0);
         #print "result:" . Dumper($result);
         foreach my $line(split(/\n/, $result->{output})) {
-            #print "line=$line\n";
             next if ($line !~ /=/ || $line !~ /^ID_/);
             my ($k,$v) = split('=', $line);
             $k =~ s/^ID_//g;
@@ -338,9 +541,6 @@ sub getVideoInfo {
     }
 }
 
-
-#-----------------------------------------------------------------------------
-# 
 #-----------------------------------------------------------------------------
 sub resolvePreset {
     my $s = shift;
@@ -389,14 +589,19 @@ sub resolvePreset {
                     }
                 } 
             } 
-
         } 
 
-        $s->fillTokens(args => $ref->{args}, tokens => \%tokens);
-    }
-    
-    print "preset:\n", Dumper(\%preset);
+        if (ref($ref->{args}) eq 'HASH') {
+            while (my ($batchName, $batchArgs) = each(%{$ref->{args}})) {
+                $s->fillTokens(args => $batchArgs, tokens => \%tokens);
+            }
+        }
+        else {
+            $s->fillTokens(args => $ref->{args}, tokens => \%tokens);
+        }
+    } 
 
+    print "preset:\n", Dumper(\%preset);
     return \%preset;
 }
 
@@ -412,205 +617,175 @@ sub fillTokens {
         }
     }
 
-    foreach my $arg (@{$args{args}}) {
-        while (my($k,$v) = each %{$args{tokens}}) {
-            my $token = '@' . $k . '@';
-            if ($arg =~ /$token/) {
-               $arg =~ s/$token/$v/g;
-            } 
-        } 
-    }
-}
-
-#-----------------------------------------------------------------------------
-# big daddy
-#-----------------------------------------------------------------------------
-sub encodeFile {
-    my $s = shift;
-    my %args = @_;
-
-    # sanity check
-    foreach my $k qw(presetName inputFile) {
-        if (! defined $args{$k}) {
-            die "missing argument '$k'";
-        }
-    }
- 
-    my $preset = $s->resolvePreset(name => $args{presetName}, inputFile => $args{inputFile});
-
-    my $videoInfo = $s->getVideoInfo($args{inputFile});
-    print "Info:\n" . Dumper($videoInfo);
-
-    print "workDir: $s->{workDir}\n";
-    chdir $s->{workDir} || die "could not cd to '$s->{workDir}': $!";
-
-    my $fps = $videoInfo->{VIDEO_FPS};
-    my $resolution = ($videoInfo->{VIDEO_WIDTH} . 'x' . $videoInfo->{VIDEO_HEIGHT});
-
-    $s->encodeVideoTrack(
-        preset => $preset, 
-        inputFile => $args{inputFile}, 
-        fps => $fps,
-        resolution => $resolution,
-    );
-
-    $s->encodeAudioTrack(
-        preset => $preset, 
-        inputFile => $args{inputFile}, 
-    );
-
-    $s->muxTracks(
-        preset => $preset, 
-        fps => $fps,
-    );
-}
-
-#-----------------------------------------------------------------------------
-sub encodeVideoTrack {
-    my $s = shift;
-    my %args = @_;
-
-    # sanity check
-    foreach my $k qw(preset inputFile fps resolution) {
-        if (! defined $args{$k}) {
-            die "missing argument '$k'";
-        }
-    }
-
-    $s->doExtractWithEncodeCommands(
-        extractTask => $args{preset}->{extractVideo},
-        extractTokens => {
-            FPS => $args{fps},
-        },
-        encodeTask  => $args{preset}->{encodeVideo},
-        encodeTokens => {
-            FPS => $args{fps},
-            RESOLUTION => $args{resolution},
-        },
-    );
-
-}
-
-#-----------------------------------------------------------------------------
-sub encodeAudioTrack {
-    my $s = shift;
-    my %args = @_;
-
-    # sanity check
-    foreach my $k qw(preset inputFile) {
-        if (! defined $args{$k}) {
-            die "missing argument '$k'";
-        }
-    }
-
-    $s->doExtractWithEncodeCommands(
-        extractTask => $args{preset}->{extractAudio},
-        encodeTask  => $args{preset}->{encodeAudio},
-    );
-}
-
-#-----------------------------------------------------------------------------
-sub muxTracks {
-    my $s = shift;
-    my %args = @_;
-
-    # sanity check
-    foreach my $k qw(preset fps) {
-        if (! defined $args{$k}) {
-            die "missing argument '$k'";
-        }
-    }
-
-    my $muxCommand =  $s->getCommandWithArgs(taskref => $args{preset}->{mux}, tokens => {
-            AUDIO_INPUT_FILE => $args{preset}->{encodeAudio}->{files}->{output},
-            VIDEO_INPUT_FILE => $args{preset}->{encodeVideo}->{files}->{output},
-            FPS => $args{fps},
-        }
-    );
-
-    $s->doCommand($muxCommand);
-}
-
-#-----------------------------------------------------------------------------
-sub doExtractWithEncodeCommands {
-    my $s = shift;
-    my %args = @_;
-
-    # sanity check
-    foreach my $k qw(extractTask encodeTask) {
-        if (! defined $args{$k}) {
-            die "missing argument '$k'";
-        }
-    }
-
-    if ($s->{reuseIntermediaryFiles}) {
-        my $destFile = $s->{workDir} . '/' . $args{encodeTask}->{files}->{output};
-        print "destFile: $destFile\n";
-        if (-f $destFile) {
-            print "encoded file '$destFile' already exists. using it.\n";
-            return;
-        }
-    }
-
-    if ($args{extractTask}->{fork}) {
-
-        print "forking extraction\n";
-
-        my $pid = fork();
-        # parent
-        if ($pid) {
-            print "extract pid = $pid, parent = $$\n";
-            push(@{$s->{childPids}}, $pid);
-   
-            sleep(4);
- 
-            my $encodeCommand =  $s->getCommandWithArgs(taskref => $args{encodeTask}, tokens => $args{encodeTokens}); 
-            $s->doCommand($encodeCommand);
-    
-            my $tmp = waitpid($pid, 0);
-            print "pid $pid finished\n";
-        }
-        # child
-        elsif ($pid == 0) {
-            my $extractCommand = $s->getCommandWithArgs(taskref => $args{extractTask}, tokens => $args{extractTokens});
-            $s->doCommand($extractCommand);
-            exit(0);
-        }
-        else {
-            die "couldn't fork: $!";
+    my $loop = $args{args};
+    if (ref($loop) eq 'HASH') {
+        while (my ($ref) = values(%{$loop})) {
         }
     }
     else {
-        my $encodeCommand =  $s->getCommandWithArgs(taskref => $args{encodeTask}, tokens => $args{encodeTokens}); 
-    
-        if (defined $args{extractTokens}) {
-            $args{extractTokens}->{ENCODE_COMMAND} = $encodeCommand;
+        foreach my $arg (@{$args{args}}) {
+            while (my($k,$v) = each %{$args{tokens}}) {
+                my $token = '@' . $k . '@';
+                if ($arg =~ /$token/) {
+                   $arg =~ s/$token/$v/g;
+                } 
+            } 
         }
-        else {
-            $args{extractTokens} = { ENCODE_COMMAND => $encodeCommand };
-        }
-    
-        my $extractCommand = $s->getCommandWithArgs(taskref => $args{extractTask}, tokens => $args{extractTokens});
-    
-        $s->doCommand($extractCommand, 1, $s->{dryRun}, 1);
     }
 }
 
 #-----------------------------------------------------------------------------
-sub doForkedExtractWithEncodeCommands {
+sub isReusingFile {
+    my $s = shift;
+    my %args = @_;
+
+    if ($s->{reuseIntermediaryFiles}) {
+        my $destFile = $s->{workDir} . '/' . $args{file};
+        if (-f $destFile) {
+            print "encoded file '$destFile' already exists. using it.\n";
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+#-----------------------------------------------------------------------------
+sub runProg {
     my $s = shift;
     my %args = @_;
 
     # sanity check
-    foreach my $k qw(extractTask encodeTask) {
+    foreach my $k qw(name) {
         if (! defined $args{$k}) {
             die "missing argument '$k'";
         }
     }
 
-
-
+   my $command = $s->getProgPath($args{name});
+   if ($args{args}) {
+       $command .= ' ' . $args{args};
+   }
+   $s->doCommand($command, $args{showOutput}, $args{dryRun});
 }
+ 
+#-----------------------------------------------------------------------------
+sub getCommandWithArgs {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(prog args) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+   
+    my $command = $s->getProgPath($args{prog});
+    if (defined $args{args}) {
+        if (ref($args{args}) eq 'ARRAY') {
+            my $parsedArgs= $s->getCommandArgs(args => $args{args}, tokens => $args{tokens}); 
+            $command .= " " . $parsedArgs;
+        }
+        else {
+            $command .= " " . $args{args};
+        }
+    }
+
+    return $command;
+}
+
+#-----------------------------------------------------------------------------
+sub getCommandArgs {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(args) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    my @tokenized;
+
+    foreach my $arg(@{$args{args}}) {  # AAARRRRGSSS MATEY!
+        while ($arg =~ /(@)([^@]+)(@)/) {
+           my $token = $2;
+           if (! defined($args{tokens})) {
+               die "tokens not defined. cannot resolve token '$token'";
+           }
+           else {
+               my $value = $args{tokens}->{$token} || die "value for token '$token' not found";
+               $arg =~ s/$1$2$3/$value/;  
+               #print "arg is now: $arg\n";
+           } 
+        }
+
+        push(@tokenized, $arg);
+    }
+
+    return join(" ", @tokenized);
+}
+
+#-----------------------------------------------------------------------------
+sub getProgPath {
+    my $s = shift;
+    my $name = shift || die "no name";
+    if (defined $s->{progs}->{$name}) {
+        return $s->{progs}->{$name};
+    }
+    else {
+        die "path for program '$name' not found";
+    }
+}
+
+#-----------------------------------------------------------------------------
+sub getPlatform {
+    my $s = shift;
+    my $ret = $s->doCommand("uname", 0, 0);
+    if ($ret->{output} eq "Darwin") {
+        print "Mac OS Detected\n";
+        return "mac";
+    }
+    else {
+        print "Linux OS Detected\n";
+        return "linux";  
+    } 
+}
+
+#-----------------------------------------------------------------------------
+sub doCommandBatch {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(prog args) {
+        if (! defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    print "args (" . ref($args{args})  . "):\n", Dumper(\%args);
+
+    if (ref($args{args}) eq 'HASH') {
+        while (my($batchName, $batchArgs) = each %{$args{args}}) {
+            print "doing command batch '$batchName'\n";
+            my $command = $s->getCommandWithArgs(
+                prog => $args{prog}, 
+                args => $batchArgs, 
+                tokens => $args{tokens}
+            );
+            $s->doCommand($command, 1, $s->{dryRun});
+        }
+    }    
+    else {
+        print "command is not a batch command.\n";
+        my $command = $s->getCommandWithArgs(%args);
+        $s->doCommand($command, 1, $s->{dryRun});
+    } 
+}
+
 #-----------------------------------------------------------------------------
 sub doCommand {
     my $s = shift;
