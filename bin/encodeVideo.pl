@@ -9,7 +9,7 @@ use Getopt::Long;
 my $p = new Getopt::Long::Parser;
 $p->configure();
 my ($reuseFiles, $dryRun, $inputFile, $bitRate);
-my $preset = 'hq';
+my $preset = 'hq1';
 
 my $result = $p->getoptions(
     "r|reuse-files" => \$reuseFiles,
@@ -22,7 +22,7 @@ my $result = $p->getoptions(
 if ($result) {
     my $enc = new Video::Encode(dryRun => $dryRun, reuseIntermediaryFiles => $reuseFiles);
     $SIG{INT} = sub { $enc->handleInt() };
-    $SIG{__DIE__} = sub { $enc->cleanUp(1) };
+    $SIG{__DIE__} = sub { $enc->cleanUp(1, shift) };
     $enc->encodeFile(presetName => $preset, inputFile => $inputFile, bitRate => $bitRate);
     #print Dumper($enc);
 }
@@ -66,6 +66,8 @@ sub initialize {
     }
 
     $s->{childPids} = [];
+    $s->{workDir} = $args{workDir} || $ENV{PWD};
+    $s->{inputFileExtensions} = qr/\.([Aa][Vv][Ii]|[Mm][Pp][Gg]|[Mm][Pp][Ee][Gg]|[Dd][Vv]|[Ff][Ll][Vv])$/;
 
     my %programs = (
         mac => { 
@@ -175,11 +177,9 @@ sub initialize {
             },
     );
 
-    $s->{workDir} = $args{workDir} || $ENV{PWD};
-
+    $s->{cmd} = Command::Simple->new();
     $s->{progs} = $programs{$s->getPlatform()} || die "could not determine platform";
-
-    $s->{inputFileExtensions} = qr/\.([Aa][Vv][Ii]|[Mm][Pp][Gg]|[Mm][Pp][Ee][Gg]|[Dd][Vv]|[Ff][Ll][Vv])$/;
+    $s->{videoInfo} = Video::Info->new(mplayerPath => $s->getProgPath('mplayer'));
 
     $s->{taskDefaults} = {
         extractVideo => {
@@ -207,30 +207,21 @@ sub initialize {
     # TODO: externalize config
     $s->{presets} = {
         hq1 => {
-            desc => 'Full Size, Deinterlaced, AAC Audio.  MPlayer extracts and encodes video.  MPlayer extract audio, neroEnc encodes audio.',
-            extractVideo => {
-                prog => 'mplayer',
-                fork => 1,
-                args => [
-                    '@INPUT_FILE@',
-                    '-vf @MEDIAN_DEINTERLACER_AND_FRAME_DUPLICATION@',
-                    '-vo yuv4mpeg:file=@FIFO_FILE@',
-                ],
-            },
+            desc => 'Same as hq1, except no deinterlacing and mencoder does extraction and encoding.',
             encodeVideo => {
-                prog => 'x264',
-                args => [
-                    '--threads auto',
-                    # expect raw input
-                    '--demuxer y4m',
-                    # Quality-based VBR (0-51, 0=lossless) [23.0]
-                    '--crf 20',
-                    #'--fps @FPS@',
-                    '--input-res @RESOLUTION@',
-                    '--output @OUTPUT_FILE@',
-                    # read from encoder
-                    '@FIFO_FILE@'
-                ],
+                prog => 'mencoder',
+                args => {
+                    pass1 => [
+                        '@X264_ENCODE_PASS_1@',
+                        '-o @OUTPUT_FILE@',
+                        '@INPUT_FILE@'
+                    ],
+                    pass2 => [
+                        '@X264_ENCODE_PASS_2@',
+                        '-o @OUTPUT_FILE@',
+                        '@INPUT_FILE@'
+                    ],
+                }
             },
             extractAudio => {
                 prog => 'mplayer',
@@ -261,29 +252,38 @@ sub initialize {
                     '-add @AUDIO_INPUT_FILE@',
                     '@OUTPUT_FILE@'
                 ],
-            }
+            },
         },
-        hq2 => {
-            desc => 'Same as hq1, except no deinterlacing and mencoder does extraction and encoding.',
+        hq2_beta => {
+            desc => 'Full Size, Deinterlaced, AAC Audio.  MPlayer extracts and encodes video.  MPlayer extract audio, neroEnc encodes audio.',
+            extractVideo => {
+                prog => 'mplayer',
+                fork => 1,
+                args => [
+                    '@INPUT_FILE@',
+                    '-vf @MEDIAN_DEINTERLACER_AND_FRAME_DUPLICATION@',
+                    '-vo yuv4mpeg:file=@FIFO_FILE@',
+                ],
+            },
             encodeVideo => {
-                prog => 'mencoder',
-                args => {
-                    pass1 => [
-                        '@X264_ENCODE_PASS_1@',
-                        '-o @OUTPUT_FILE@',
-                        '@INPUT_FILE@'
-                    ],
-                    pass2 => [
-                        '@X264_ENCODE_PASS_2@',
-                        '-o @OUTPUT_FILE@',
-                        '@INPUT_FILE@'
-                    ],
-                }
+                prog => 'x264',
+                args => [
+                    '--threads auto',
+                    # expect raw input
+                    '--demuxer y4m',
+                    # Quality-based VBR (0-51, 0=lossless) [23.0]
+                    '--crf 20',
+                    #'--fps @FPS@',
+                    '--input-res @RESOLUTION@',
+                    '--output @OUTPUT_FILE@',
+                    # read from encoder
+                    '@FIFO_FILE@'
+                ],
             },
             extractAudio => 'alias:hq1',
             encodeAudio => 'alias:hq1',
             mux => 'alias:hq1',
-        }
+        },
     };
 }
 
@@ -344,7 +344,7 @@ sub encodeFile {
  
     my $preset = $s->resolvePreset(name => $args{presetName}, inputFile => $args{inputFile});
 
-    my $videoInfo = $s->getVideoInfo($args{inputFile});
+    my $videoInfo = $s->{videoInfo}->readVideoFile(file => $args{inputFile});
     print "videoInfo:\n" . Dumper($videoInfo);
 
     print "workDir: $s->{workDir}\n";
@@ -375,6 +375,13 @@ sub encodeFile {
         preset => $preset, 
         fps => $fps,
     );
+
+    my $outputFile = $s->{workDir} . '/' . $preset->{mux}->{files}->{output};
+    my $outVideoInfo = $s->{videoInfo}->readVideoFile(file => $outputFile);
+
+    print "-"x10, "Stats", "-"x10, "\n";
+    print "In: $videoInfo->{SIZE_HUMAN} / $videoInfo->{VIDEO_BITRATE} kbps / $videoInfo->{BITRATE_HUMAN}/s\n";
+    print "Out: $outVideoInfo->{SIZE_HUMAN} / $outVideoInfo->{VIDEO_BITRATE} kbps / $outVideoInfo->{BITRATE_HUMAN}/s)\n";
 
     $s->cleanUp();
 }
@@ -465,6 +472,12 @@ sub _encodeTrack {
     }
 }
 
+#-----------------------------------------------------------------------------
+sub doCommand {
+    my $s = shift;
+    $s->{cmd}->doCommand(@_);
+}
+ 
 #-----------------------------------------------------------------------------
 sub muxTracks {
     my $s = shift;
@@ -569,33 +582,7 @@ sub doExtractWithEncodeCommands {
     }
 }
 
-#-----------------------------------------------------------------------------
-sub getVideoInfo {
-    my $s = shift;
-    my $file = shift || die "no file";
-    my $key = shift;
 
-    # http://lists.mplayerhq.hu/pipermail/mplayer-users/2007-March/066366.html
-    my $opts = "-identify -vo null -frames 0 $file";
-
-    if ($key) {
-        my $result = $s->runProg(name => "mplayer", args => "$opts | grep $key", showOutput => 0, dryRun => 0);
-        my $output = $result->{output};
-        $output =~ s/$key=//;
-        return $output;
-    }
-    else {
-        my %info;
-        my $result = $s->runProg(name => "mplayer", args => $opts, showOutput => 0, dryRun => 0);
-        foreach my $line(split(/\n/, $result->{output})) {
-            next if ($line !~ /=/ || $line !~ /^ID_/);
-            my ($k,$v) = split('=', $line);
-            $k =~ s/^ID_//g;
-            $info{$k} = $v;
-        }
-        return \%info;
-    }
-}
 
 #-----------------------------------------------------------------------------
 sub resolvePreset {
@@ -609,7 +596,7 @@ sub resolvePreset {
         }
     }
 
-    my $tmp = $s->{presets}->{$args{name}} || die "could not find preset '$args{name}'\n";
+    my $tmp = $s->{presets}->{$args{name}} || die "could not find preset '$args{name}'";
     # we're gonna change up some values, so let's work on a copy
     my %preset = %{ clone($tmp) };
 
@@ -934,6 +921,80 @@ sub doCommandBatch {
     } 
 }
 
+
+
+#-----------------------------------------------------------------------------
+sub registerPid {
+    my $s = shift;
+    my $pid = shift || die "no pid received";
+    unshift(@{$s->{childPids}}, $pid);
+}
+
+#-----------------------------------------------------------------------------
+sub cleanUp {
+    my $s = shift;
+    my $exitCode = shift;
+    my $error = shift;
+    if ($error) {
+        print "ERROR: $error";
+    }
+
+    my @pids;
+    if (scalar(@{$s->{childPids}})) {
+        push (@pids, @{$s->{childPids}});
+    }
+    if (scalar(@{$s->{cmd}->{childPids}})) {
+        push (@pids, @{$s->{cmd}->{childPids}});
+    }
+
+    if (@pids) {
+        print "killing children: ", join(',', @pids), "\n";
+        kill 15, @pids;
+    }
+    if (defined $exitCode) {
+        exit($exitCode);
+    }
+}
+
+#-----------------------------------------------------------------------------
+sub handleInt {
+    my $s = shift;
+    print "caught INT\n";
+    $s->cleanUp(1);
+}
+
+#=============================================================================
+#
+#=============================================================================
+package Command::Simple;
+
+use strict;
+
+#------------------------------------------------------------------------------
+sub new {
+    my $proto = shift;
+    my $class = ref($proto) || $proto;
+    my $s  = {};
+    bless ($s, $class);
+    $s->initialize(@_);
+    return $s;
+}
+
+#------------------------------------------------------------------------------
+sub initialize {
+    my $s = shift;
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(dryRun) {
+        if (defined $args{$k}) {
+            $s->{$k} = $args{$k};
+        }
+    }
+
+    $s->{childPids} = [];
+}
+
 #-----------------------------------------------------------------------------
 sub doCommand {
     my $s = shift;
@@ -995,24 +1056,102 @@ sub registerPid {
     unshift(@{$s->{childPids}}, $pid);
 }
 
-#-----------------------------------------------------------------------------
-sub cleanUp {
+#=============================================================================
+#
+#=============================================================================
+package Video::Info;
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use File::stat;
+use Format::Human::Bytes;
+
+#------------------------------------------------------------------------------
+sub new {
+    my $proto = shift;
+    my $class = ref($proto) || $proto;
+    my $s  = {};
+    bless ($s, $class);
+    $s->initialize(@_);
+    return $s;
+}
+
+#------------------------------------------------------------------------------
+sub initialize {
     my $s = shift;
-    my $exitCode = shift;
-    if (scalar(@{$s->{childPids}})) {
-        print "killing children: ", join(',', @{$s->{childPids}}), "\n";
-        kill 15, @{$s->{childPids}};
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(file) {
+        if (defined $args{$k}) {
+            $s->{$k} = $args{$k};
+        }
     }
-    if (defined $exitCode) {
-        exit($exitCode);
-    }
+
+    $s->{mplayerPath} = $args{mplayerPath} || die "missing argument 'mplayerPath'";
+    $s->{cmd} = Command::Simple->new();
 }
 
 #-----------------------------------------------------------------------------
-sub handleInt {
+sub readVideoFile {
     my $s = shift;
-    print "caught INT\n";
-    $s->cleanUp(1);
+    my %args = @_;
+
+    # sanity check
+    foreach my $k qw(file) {
+        if (!defined $args{$k}) {
+            die "missing argument '$k'";
+        }
+    }
+
+    my $info = $s->_getVideoInfo($args{file}); 
+
+    my $human =  Format::Human::Bytes->new();
+    my $stat = stat($args{file}) || die "$!";
+
+    $info->{SIZE_HUMAN} = $human->base2($stat->size);
+    #$info->{BITRATE_KBYTES} = ($info->{VIDEO_BITRATE}/8/1024);
+    $info->{BITRATE_HUMAN} = $human->base2(($info->{VIDEO_BITRATE}/8));
+
+    #foreach my $item qw(BITRATE_KBYTES) {
+    #    $info->{$item} =~ s/\.(\d)(.+)/$1/;
+    #}
+
+    #$info->{BITRATE_KBITS} .= ' Kbits/sec';
+    #$info->{BITRATE_KBYTES} .= ' KBytes/sec';
+
+    return $info;
+}
+
+#-----------------------------------------------------------------------------
+sub _getVideoInfo {
+    my $s = shift;
+    my $file = shift || die "no file";
+    my $key = shift;
+
+    # http://lists.mplayerhq.hu/pipermail/mplayer-users/2007-March/066366.html
+    my $opts = "-identify -vo null -ao null -frames 0 $file";
+
+    if ($key) {
+        my $result = $s->{cmd}->doCommand("$s->{mplayerPath} $opts | grep $key", 0, 0);
+        my $output = $result->{output};
+        $output =~ s/$key=//;
+        return $output;
+    }
+    else {
+        my %info;
+        my $result = $s->{cmd}->doCommand("$s->{mplayerPath} $opts", 0, 0);
+        #my $result = $s->runProg(name => "mplayer", args => $opts, showOutput => 0, dryRun => 0);
+        foreach my $line(split(/\n/, $result->{output})) {
+            next if ($line !~ /=/ || $line !~ /^ID_/);
+            my ($k,$v) = split('=', $line);
+            $k =~ s/^ID_//g;
+            $info{$k} = $v;
+        }
+        return \%info;
+    }
 }
 
 1;
